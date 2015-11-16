@@ -54,6 +54,7 @@ module Fog
         #     Example: ['cluster_name_here','resource_pool_name_here']
         #   * 'datastore'<~String> - The datastore you'd like to use.
         #       (datacenterObj.datastoreFolder.find('name') in API)
+        #   * 'storage_pod'<~String> - The storage pod / datastore cluster you'd like to use.
         #   * 'transform'<~String> - Not documented - see http://www.vmware.com/support/developer/vc-sdk/visdk41pubs/ApiReference/vim.vm.RelocateSpec.html
         #   * 'numCPUs'<~Integer> - the number of Virtual CPUs of the Destination VM
         #   * 'memoryMB'<~Integer> - the size of memory of the Destination VM in MB
@@ -537,6 +538,9 @@ module Fog
 
           relocation_spec=nil
           if ( options['linked_clone'] )
+            # Storage DRS does not support vSphere linked clones.
+            # http://www.vmware.com/files/pdf/techpaper/vsphere-storage-drs-interoperability.pdf
+            raise ArgumentError, "linked clones are not supported on storage pods" unless options.key?('storage_pod')
             # cribbed heavily from the rbvmomi clone_vm.rb
             # this chunk of code reconfigures the disk of the clone source to be read only,
             # and then creates a delta disk on top of that, this is required by the API in order to create
@@ -569,9 +573,11 @@ module Fog
                                                                       :pool => resource_pool,
                                                                       :diskMoveType => :moveChildMostDiskBacking)
           else
-            relocation_spec = RbVmomi::VIM.VirtualMachineRelocateSpec(:datastore => datastore_obj,
-                                                                      :pool => resource_pool,
+            relocation_spec = RbVmomi::VIM.VirtualMachineRelocateSpec(:pool => resource_pool,
                                                                       :transform => options['transform'] || 'sparse')
+            unless options.key?('storage_pod')
+              relocation_spec[:datastore] = datastore_obj unless datastore_obj.nil?
+            end
           end
           # And the clone specification
           clone_spec = RbVmomi::VIM.VirtualMachineCloneSpec(:location => relocation_spec,
@@ -581,31 +587,57 @@ module Fog
                                                             :template => false)
 
           # Perform the actual Clone Task
-          task = vm_mob_ref.CloneVM_Task(:folder => dest_folder,
+          # Clone VM on a storage pod
+          if options.key?('storage_pod')
+            raise ArgumentError, "need to use at least vsphere revision 5.0 or greater to use storage pods" unless @vsphere_rev.to_f >= 5
+            pod_spec     = RbVmomi::VIM::StorageDrsPodSelectionSpec.new(
+              :storagePod => get_raw_storage_pod(options['storage_pod'], options['datacenter']),
+            )
+            storage_spec = RbVmomi::VIM::StoragePlacementSpec.new(
+              :type => 'clone',
+              :folder => dest_folder,
+              :resourcePool => resource_pool,
+              :podSelectionSpec => pod_spec,
+              :cloneSpec => clone_spec,
+              :cloneName => options['name'],
+              :vm => vm_mob_ref,
+            )
+            srm = @connection.serviceContent.storageResourceManager
+            result = srm.RecommendDatastores(:storageSpec => storage_spec)
+
+            # if result array contains recommendation, we can apply it
+            if key = result.recommendations.first.key
+              task = srm.ApplyStorageDrsRecommendation_Task(:key => [key])
+              result = task.wait_for_completion
+              new_vm = result.vm
+            end
+          else
+            task = vm_mob_ref.CloneVM_Task(:folder => dest_folder,
                                          :name => options['name'],
                                          :spec => clone_spec)
-          # Waiting for the VM to complete allows us to get the VirtulMachine
-          # object of the new machine when it's done.  It is HIGHLY recommended
-          # to set 'wait' => true if your app wants to wait.  Otherwise, you're
-          # going to have to reload the server model over and over which
-          # generates a lot of time consuming API calls to vmware.
-          if options.fetch('wait', true) then
-            # REVISIT: It would be awesome to call a block passed to this
-            # request to notify the application how far along in the process we
-            # are.  I'm thinking of updating a progress bar, etc...
-            new_vm = task.wait_for_completion
-          else
-            tries = 0
-            new_vm = begin
-              # Try and find the new VM (folder.find is quite efficient)
-              dest_folder.find(options['name'], RbVmomi::VIM::VirtualMachine) or raise Fog::Vsphere::Errors::NotFound
-            rescue Fog::Vsphere::Errors::NotFound
-              tries += 1
-              if tries <= 10 then
-                sleep 15
-                retry
+            # Waiting for the VM to complete allows us to get the VirtulMachine
+            # object of the new machine when it's done.  It is HIGHLY recommended
+            # to set 'wait' => true if your app wants to wait.  Otherwise, you're
+            # going to have to reload the server model over and over which
+            # generates a lot of time consuming API calls to vmware.
+            if options.fetch('wait', true) then
+              # REVISIT: It would be awesome to call a block passed to this
+              # request to notify the application how far along in the process we
+              # are.  I'm thinking of updating a progress bar, etc...
+              new_vm = task.wait_for_completion
+            else
+              tries = 0
+              new_vm = begin
+                # Try and find the new VM (folder.find is quite efficient)
+                dest_folder.find(options['name'], RbVmomi::VIM::VirtualMachine) or raise Fog::Vsphere::Errors::NotFound
+              rescue Fog::Vsphere::Errors::NotFound
+                tries += 1
+                if tries <= 10 then
+                  sleep 15
+                  retry
+                end
+                nil
               end
-              nil
             end
           end
 
